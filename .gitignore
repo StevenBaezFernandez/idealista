@@ -1,1 +1,3 @@
 apikey_index.json
+.env
+nodemon.json
