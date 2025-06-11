@@ -53,24 +53,29 @@ function getNextApiKey() {
   return apiKeys[nextIndex];
 }
 
-// Initialize Google Sheets API
+
 async function initGoogleSheets() {
   const auth = new google.auth.GoogleAuth({
-    keyFile: process.env.GOOGLE_CREDENTIALS_PATH,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const sheets = google.sheets({ version: "v4", auth });
-  const spreadsheet = await sheets.spreadsheets.get({
-    spreadsheetId: '13cZUgpWK5zDleUb8Ywy78MaQASP9NPyKyAJqAmHoYbQ'
-  });
-  console.log('Sheets:', spreadsheet.data.sheets.map(s => s.properties.title));
-  
-  const authClient = await auth.getClient();
-  return google.sheets({
-    version: 'v4',
-    auth: authClient
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      project_id: process.env.GOOGLE_PROJECT_ID,
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'], // or full access
   });
 
+  const authClient = await auth.getClient();
+
+  const sheets = google.sheets({ version: 'v4', auth: authClient });
+
+  const spreadsheet = await sheets.spreadsheets.get({
+    spreadsheetId: '13cZUgpWK5zDleUb8Ywy78MaQASP9NPyKyAJqAmHoYbQ',
+  });
+
+  console.log('Sheets:', spreadsheet.data.sheets.map(s => s.properties.title));
+
+  return sheets;
 }
 
 // Append data to Google Sheet
