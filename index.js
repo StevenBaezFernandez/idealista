@@ -3,7 +3,10 @@ const https = require('https');
 const http = require('http');
 const url = require('url');
 const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 require('dotenv').config();
+
+console.log("google credentials: ", process.env.GOOGLE_CREDENTIALS_PATH)
 
 const PORT = 3000;
 const API_ENDPOINT = '/extract';
@@ -15,12 +18,14 @@ const apiKeys = [
   '761eba8edcmsheec2c20dc3cffc5p18b22fjsn0254fa46a1fd',
 ];
 
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY; // Replace with your actual DeepSeek API key
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID; // From .env
+const SHEET_NAME = 'Properties'; // Your sheet name
 const EMAIL_CONFIG = {
-  service: 'gmail', // Change if using different provider
+  service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER, // Replace with your email
-    pass: process.env.EMAIL_PASSWORD // Replace with your email password/app-specific password
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD
   }
 };
 
@@ -46,6 +51,71 @@ function getNextApiKey() {
   const nextIndex = (lastIndex + 1) % apiKeys.length;
   saveLastUsedIndex(nextIndex);
   return apiKeys[nextIndex];
+}
+
+// Initialize Google Sheets API
+async function initGoogleSheets() {
+  const auth = new google.auth.GoogleAuth({
+    keyFile: process.env.GOOGLE_CREDENTIALS_PATH,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  const sheets = google.sheets({ version: "v4", auth });
+  const spreadsheet = await sheets.spreadsheets.get({
+    spreadsheetId: '13cZUgpWK5zDleUb8Ywy78MaQASP9NPyKyAJqAmHoYbQ'
+  });
+  console.log('Sheets:', spreadsheet.data.sheets.map(s => s.properties.title));
+  
+  const authClient = await auth.getClient();
+  return google.sheets({
+    version: 'v4',
+    auth: authClient
+  });
+
+}
+
+// Append data to Google Sheet
+async function saveToGoogleSheets(sheets, data) {
+  try {
+    // Map data to spreadsheet columns
+    const rowData = [
+      data.assetType || '',
+      data.title || '',
+      'Active',
+      data.address || '',
+      data.district || '',
+      data.city || '',
+      data.url || '',
+      data.floor || '',
+      data.size || '',
+      data.rooms || '',
+      data.bathrooms || '',
+      data.yearBuilt || '',
+      data.agency || '',
+      data.publicationDate || '',
+      data.price || '',
+      data.counterofferPrice || '',
+      data.pricePerSqm || '',
+      data.estimatedSalePrice || '',
+      data.expectedProfitability || ''
+    ];
+    
+
+    const response = await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `Properties!A:W`,
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      resource: {
+        values: [rowData]
+      }
+    });
+
+    console.log(`✅ Data saved to Google Sheets: ${response.data.updates.updatedCells} cells updated`);
+    return response;
+  } catch (err) {
+    console.error('❌ Google Sheets API error:', err);
+    throw err;
+  }
 }
 
 // Send email with analysis results
@@ -75,80 +145,72 @@ async function sendAnalysisEmail(recipientEmail, analysisResult) {
   }
 }
 
+// Extract numbers from DeepSeek response
+function extractFinancialData(analysisText) {
+  const result = {
+    counterofferPrice: null,
+    pricePerSqm: null,
+    estimatedSalePrice: null,
+    expectedProfitability: null
+  };
+
+  // Extract counteroffer price
+  const counterofferMatch = analysisText.match(/Precio de contraoferta:\s*([\d,.]+)/i);
+  if (counterofferMatch) {
+    result.counterofferPrice = parseFloat(counterofferMatch[1].replace('.', '').replace(',', '.'));
+  }
+
+  // Extract price per m²
+  const pricePerSqmMatch = analysisText.match(/Precio\/m2:\s*([\d,.]+)/i);
+  if (pricePerSqmMatch) {
+    result.pricePerSqm = parseFloat(pricePerSqmMatch[1].replace('.', '').replace(',', '.'));
+  }
+
+  // Extract estimated sale price
+  const salePriceMatch = analysisText.match(/Precio estimado de venta:\s*([\d,.]+)/i);
+  if (salePriceMatch) {
+    result.estimatedSalePrice = parseFloat(salePriceMatch[1].replace('.', '').replace(',', '.'));
+  }
+
+  // Extract expected profitability
+  const profitabilityMatch = analysisText.match(/Rentabilidad esperada:\s*([\d,.]+)%/i);
+  if (profitabilityMatch) {
+    result.expectedProfitability = parseFloat(profitabilityMatch[1].replace(',', '.'));
+  }
+
+  return result;
+}
+
 // Analyze property data with DeepSeek API
-function analyzeWithDeepSeek(propertyData, recipientEmail) {
+async function analyzeWithDeepSeek(sheets, propertyData, recipientEmail) {
   const ANALYSIS_PROMPT = `
-Eres experto en análisis de rentabilidades financieras para operaciones de activos inmobiliarios. Quiero que en base a la información adjunta aquí y la información que adjunte en formato json:
+Eres experto en análisis de rentabilidades financieras para operaciones de activos inmobiliarios. Quiero que en base a la información adjunta:
 
-•⁠  ⁠Ubicación exacta (Calle, numero, código postal, portal, piso, puerta)
-•⁠  ⁠Dimensiones (m2)
-•⁠  ⁠Distribución de la vivienda actual (si se tiene plano, adjuntar)
-•⁠  ⁠Distribución de la vivienda después de la reforma (si se tiene plano, adjuntar)
-•⁠  ⁠Condiciones iniciales de compra por parte del propietario
-•⁠  ⁠Pago de arras (en %)
-•⁠  ⁠Carencia necesaria hasta terminar la reforma (al final de la carencia se pagaría el restante que falta sobre las arras)
-•⁠  ⁠Cantidad de equity a aportar en la compra
-•⁠  ⁠Cantidad de préstamo y condiciones del préstamo
-•⁠  ⁠Estado actual del inmueble (fotos, videos...)
-•⁠  ⁠Precio de reforma estimada (si se conoce)
-•⁠  ⁠Nota simple actualizada
-•⁠  ⁠Etiqueta energética
-•⁠  ⁠ITE del edificio
-•⁠  ⁠3 últimas actas de juntas
+• Ubicación: ${propertyData.address || 'No disponible'}
+• Dimensiones: ${propertyData.size ? propertyData.size + ' m²' : 'No disponible'}
+• Precio: ${propertyData.price ? propertyData.price + ' €' : 'No disponible'}
+• Habitaciones: ${propertyData.rooms || 'No disponible'}
+• Año construcción: ${propertyData.yearBuilt || 'No disponible'}
 
+Analiza la propiedad y proporciona los siguientes valores numéricos específicos:
 
-Tienes que ser capaz de analizar, valorar y emitir un informe de rentabilidad de cada operación en la modalidad de Compra-reforma-venta (Contando con 800€-1000€/m2 de reforma estimada) o Compra-Reforma-Cambio de uso a turístico-Alquiler turístico (Analizando el documento de los ADRs adjunto) con el fin de evaluar rápidamente cuál sería el precio de compra ideal analizando el precio medio de venta de la zona a través de idealista.
+1. Precio de contraoferta recomendado (en formato: Precio de contraoferta: [valor])
+2. Precio por metro cuadrado (en formato: Precio/m2: [valor])
+3. Precio estimado de venta después de reforma (en formato: Precio estimado de venta: [valor])
+4. Rentabilidad esperada en porcentaje (en formato: Rentabilidad esperada: [valor]%)
 
-En la modalidad de Compra-Reforma-Cambio de uso a turístico-Alquiler turístico tienes que ser capaz de analizar cuántas unidades de al menos 35m2 podrían salir y en base a ese número calcular la rentabilidad en base a los ADRs aportados.
+Además, incluye un análisis detallado que contenga:
 
-Puedes extraer información de idealista para conocer el precio por m2 de compra y alquiler de cada piso propuesto para evaluar su posible rentabilidad.
-
-Para el cálculo de las plusvalías, ten en cuenta este enlace: https://sede.agenciatributaria.gob.es/Sede/ayuda/manuales-videos-folletos/manuales-practicos/manual-tributacion-no-residentes/capitulo-03-tributacion-rentas-comunes-nr/ganancias-patrimoniales/ganancias-patrimoniales-derivadas-venta-inmuebles.html
-
-Este es el mapa de pisos turísticos en Madrid: https://www-2.munimadrid.es/IDEAM_WBGEOPORTAL/visor_ide.iam?ArcGIS=https://sigma.madrid.es/hosted/rest/services/VIVIENDA/VIVIENDAS_TURISTICAS/MapServer
-
-Al finalizar el análisis de rentabilidad quiero que propongas el precio de contraoferta que cumpla con una rentabilidad de al menos un 20% en compra-reforma-venta aportando un resumen como este:
-
-•⁠  ⁠Tipo de operación: CRV
-•⁠  ⁠Ubicación: Ciudad, distrito y barrio
-•⁠  ⁠Precio de salida: Precio (Precio/m2)
-•⁠  ⁠ITP y fiscalidad a pagar:
-•⁠  ⁠Honorarios Black Rocket: (Calcúlalos en base al documento "Propuesta Hestia - BR" adjunto)
-•⁠  ⁠Coste de reforma + amueblado + imprevistos (800€-1000€/m2 de reforma)
-•⁠  ⁠Propuesta de precio de compra (analizando el precio medio del m2 de la zona en esta https://www.idealista.com/sala-de-prensa/informes-precio-vivienda/alquiler/madrid-comunidad/madrid-provincia/madrid/): Precio (Precio/m2)
-•⁠  ⁠Ingresos mensuales previstos (si es CRA o R2R)
-•⁠  ⁠Rentabilidad neta anual (%)
-•⁠  ⁠ROE: (%)
-•⁠  ⁠Yield:
-
-Añade al análisis una posible operación de:
-
-•⁠  ⁠Arras del 10-15%
-•⁠  ⁠8 meses hasta escrituración
-•⁠  ⁠Reforma y reconversión a piso turístico durante el proceso desde el pago de arras hasta la escrituración
-•⁠  ⁠Cesión de arras y venta de inmueble con valor añadido.
-
-También quiero que añadas un resumen al final con esta estructura para poder reenviar cada operación a Hestia Viable Capital que nos contrata:
-
-1.⁠ ⁠Tipo de operación: CRV
-2.⁠ ⁠Tipo de activo: (Edificio, local o piso)
-3.⁠ ⁠Ciudad y distrito o barrio
-4.⁠ ⁠Precio de salida
-5.⁠ ⁠Arras estimadas
-6.⁠ ⁠Inversión total (Arras + reforma y mobiliario + cambio de uso turístico + ITP + Honorarios BR)
-5.⁠ ⁠ADR de la zona
-6.⁠ ⁠Precio de venta estimado
-7.⁠ ⁠ROE
-
+• Tipo de operación recomendada (CRV o CRA)
+• Ubicación (Ciudad, distrito y barrio)
+• Resumen de costes (ITP, honorarios, reforma)
+• Rentabilidad neta anual y ROE
+• Estrategia de inversión recomendada
 
 Datos de la propiedad:
 ${JSON.stringify(propertyData, null, 2)}
 
-Calcula:
-- Precio de compra ideal
-- Inversión total estimada
-- ROI para ambas modalidades
-- Recomendación de estrategia
+Calcula los valores específicos solicitados y proporciona el análisis completo.
   `;
 
   const options = {
@@ -161,59 +223,94 @@ Calcula:
     }
   };
 
-  const req = https.request(options, async (deepseekRes) => {
-    console.log("hello world!!")
-    console.log('api key deepseek: ', DEEPSEEK_API_KEY);
-    let data = '';
-    deepseekRes.on('data', (chunk) => data += chunk);
-    
-    deepseekRes.on('end', () => {
-      try {
-        const response = JSON.parse(data);
-        console.log("deepseek response: ",response);
-        
-        if (response.choices && response.choices.length > 0) {
-          const analysis = response.choices[0].message.content;
-          console.log('✅ Received analysis from DeepSeek');
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, async (deepseekRes) => {
+      let data = '';
+      deepseekRes.on('data', (chunk) => data += chunk);
+      
+      deepseekRes.on('end', async () => {
+        try {
+          const response = JSON.parse(data);
           
-          // Send analysis via email
-          sendAnalysisEmail(recipientEmail, analysis)
-          .then(() => console.log('📩 Analysis report emailed successfully'))
-          .catch(err => console.error('❌ Failed to email analysis:', err));
-        } else {
-          throw new Error('Invalid response from DeepSeek API');
+          if (response.choices && response.choices.length > 0) {
+            const analysis = response.choices[0].message.content;
+            console.log('✅ Received analysis from DeepSeek');
+            
+            // Extract financial data from analysis
+            const financialData = extractFinancialData(analysis);
+            let  style = {
+              style: 'currency',
+              currency: "EUR"
+            };
+            const propertyPriceFormatter = new Intl.NumberFormat("es", style)
+            
+            // Prepare spreadsheet data
+            const sheetData = {
+              assetType: propertyData.propertyType || 'Piso',
+              title: propertyData.suggestedTexts.title || '',
+              address: propertyData.ubication.title || '',
+              district: propertyData.ubication.administrativeAreaLevel3 || '',
+              city: propertyData.ubication.administrativeAreaLevel2 || '',
+              url: `https://www.idealista.com/inmueble/${propertyData.propertyId}/`,
+              floor: propertyData.floor || '',
+              size: propertyData.moreCharacteristics.constructedArea || '',
+              rooms: propertyData.moreCharacteristics.roomNumber || propertyData.moreCharacteristics.roomDistributionNumber || '',
+              bathrooms: propertyData.moreCharacteristics.bathNumber || '',
+              yearBuilt: propertyData.yearBuilt || '',
+              agency: propertyData.contactInfo.commercialName || 'Private',
+              publicationDate: propertyData.publicationDate || new Date().toISOString().split('T')[0],
+              price: propertyPriceFormatter.format(propertyData.price) + propertyData.priceInfo.currencySuffix || '',
+              counterofferPrice: financialData.counterofferPrice,
+              pricePerSqm: financialData.pricePerSqm,
+              estimatedSalePrice: financialData.estimatedSalePrice,
+              expectedProfitability: financialData.expectedProfitability
+            };
+
+            // Save to Google Sheets
+            await saveToGoogleSheets(sheets, sheetData);
+            
+            // Send analysis via email
+            await sendAnalysisEmail(recipientEmail, analysis);
+            console.log('📩 Analysis report emailed successfully');
+            
+            resolve();
+          } else {
+            throw new Error('Invalid response from DeepSeek API');
+          }
+        } catch (err) {
+          console.error('❌ DeepSeek processing error:', err);
+          reject(err);
         }
-      } catch (err) {
-        console.error('❌ DeepSeek response parsing failed on :', err);
-      }
+      });
     });
+
+    req.on('error', (err) => {
+      console.error('❌ DeepSeek API request failed:', err);
+      reject(err);
+    });
+
+    req.write(JSON.stringify({
+      model: "deepseek-chat",
+      messages: [
+        { role: "system", content: "Eres un experto en análisis de inversiones inmobiliarias especializado en reformas y conversión a alojamientos turísticos." },
+        { role: "user", content: ANALYSIS_PROMPT }
+      ],
+      temperature: 0.3,
+      max_tokens: 2000
+    }));
+
+    req.end();
   });
-
-  req.on('error', (err) => {
-    console.error('❌ DeepSeek API request failed:', err);
-  });
-
-  req.write(JSON.stringify({
-    model: "deepseek-chat",
-    messages: [
-      { role: "system", content: "Eres un experto en análisis de inversiones inmobiliarias especializado en reformas y conversión a alojamientos turísticos." },
-      { role: "user", content: ANALYSIS_PROMPT }
-    ],
-    temperature: 0.3,
-    max_tokens: 2000
-  }));
-
-  req.end();
 }
 
 // Fetch property details from Idealista API
-function fetchPropertyDetails(propertyId, recipientEmail) {
+function fetchPropertyDetails(sheets, propertyId, recipientEmail) {
   const apiKey = getNextApiKey();
   
   const options = {
     method: 'GET',
     hostname: 'idealista7.p.rapidapi.com',
-    path: `/propertydetails?propertyId=${propertyId}&location=es&language=en`,
+    path: `/propertydetails?propertyId=${propertyId}&location=es&language=es`,
     headers: {
       'x-rapidapi-key': apiKey,
       'x-rapidapi-host': 'idealista7.p.rapidapi.com'
@@ -225,15 +322,16 @@ function fetchPropertyDetails(propertyId, recipientEmail) {
     
     apiRes.on('data', (chunk) => data += chunk);
     
-    apiRes.on('end', () => {
+    apiRes.on('end', async () => {
       console.log(`✅ Used API key: ${apiKey}`);
       
       try {
         const propertyData = JSON.parse(data);
+        propertyData.propertyId = propertyId; // Add property ID to object
         console.log(`🔍 Fetched property detail (${propertyId})`);
         
         // Send to DeepSeek for analysis
-        analyzeWithDeepSeek(propertyData, recipientEmail);
+        await analyzeWithDeepSeek(sheets, propertyData, recipientEmail);
       } catch (err) {
         console.error('❌ JSON parsing failed:', err);
       }
@@ -247,72 +345,89 @@ function fetchPropertyDetails(propertyId, recipientEmail) {
   req.end();
 }
 
-// Create HTTP server
-const server = http.createServer((req, res) => {
-  const { pathname } = url.parse(req.url, true);
-  
-  if (req.method === 'POST' && pathname === API_ENDPOINT) {
-    let body = '';
-    
-    req.on('data', chunk => body += chunk);
-    
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body);
-        
-        // Validate request format
-        if (!payload || typeof payload.emailBody !== 'string' || !payload.recipientEmail) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ 
-            error: 'Invalid request format',
-            message: 'Missing emailBody or recipientEmail'
-          }));
-        }
-        
-        // Extract property ID
-        const regex = /(?<=https:\/\/www\.idealista\.com\/inmueble\/)\d+/;
-        const match = payload.emailBody.match(regex);
-        
-        if (!match) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          return res.end(JSON.stringify({ 
-            error: 'Property ID not found',
-            message: 'No valid Idealista URL found in email body'
-          }));
-        }
-        
-        const propertyId = match[0];
-        console.log(`🔍 Extracted property ID: ${propertyId}`);
-        
-        // Start processing and respond immediately
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-          status: 'processing',
-          message: 'Analysis started. Results will be sent to your email.',
-          propertyId
-        }));
-        
-        // Fetch property details and start analysis pipeline
-        fetchPropertyDetails(propertyId, payload.recipientEmail);
-        
-      } catch (err) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-          error: 'Invalid JSON format',
-          message: err.message
-        }));
-      }
-    });
-  } else {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      error: 'Not found',
-      message: 'Only POST requests to /extract are supported'
-    }));
-  }
-});
+debugger
 
-// Start the server
-server.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
+// Main server function
+async function main() {
+  // Initialize Google Sheets API once
+  const sheets = await initGoogleSheets();
+  console.log('🔑 Authenticated with Google Sheets API');
+
+  // Create HTTP server
+  const server = http.createServer((req, res) => {
+    const { pathname } = url.parse(req.url, true);
+    
+    if (req.method === 'POST' && pathname === API_ENDPOINT) {
+      let body = '';
+      
+      req.on('data', chunk => body += chunk);
+      
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body);
+          
+          // Validate request format
+          if (!payload || typeof payload.emailBody !== 'string' || !payload.recipientEmail) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ 
+              error: 'Invalid request format',
+              message: 'Missing emailBody or recipientEmail'
+            }));
+          }
+          
+          // Extract property ID
+          const regex = /https:\/\/www\.idealista\.com\/inmueble\/(\d+)/;
+          const match = payload.emailBody.match(regex);
+          
+          if (!match || !match[1]) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ 
+              error: 'Property ID not found',
+              message: 'No valid Idealista URL found in email body'
+            }));
+          }
+          
+          const propertyId = match[1];
+          console.log(`🔍 Extracted property ID: ${propertyId}`);
+          
+          // Start processing and respond immediately
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            status: 'processing',
+            message: 'Analysis started. Results will be sent to your email and saved to Google Sheets.',
+            propertyId,
+            spreadsheetId: SPREADSHEET_ID
+          }));
+          
+          // Fetch property details and start analysis pipeline
+          fetchPropertyDetails(sheets, propertyId, payload.recipientEmail);
+          
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            error: 'Invalid JSON format',
+            message: err.message
+          }));
+        }
+      });
+    } else {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        error: 'Not found',
+        message: 'Only POST requests to /extract are supported'
+      }));
+    }
+  });
+
+  // Start the server
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running at http://localhost:${PORT}`);
+    console.log(`📊 Data will be saved to Google Sheets: ${SPREADSHEET_ID}`);
+  });
+}
+
+// Start the application
+main().catch(err => {
+  console.error('❌ Critical error during startup:', err);
+  process.exit(1);
 });
