@@ -2,4 +2,4 @@ apikey_index.json
 .env
 nodemon.json
 .vercel
-node_modules
+node_modules/
